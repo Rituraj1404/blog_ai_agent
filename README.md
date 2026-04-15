@@ -129,10 +129,10 @@ streamlit run bwa_frontend.py
 
 ## 🚀 Future Improvements
 
-- [ ] Diagram generation (Mermaid)
+- [ ] Diagram generation 
 - [ ] Agent memory (long-term context)
 - [ ] Web scraping for real-time research
-- [ ] Deployment (Docker + cloud)
+
 
 ---
 
