@@ -1,5 +1,8 @@
 from __future__ import annotations
+import os
+os.environ.setdefault("GOOGLE_API_KEY", "dummy")
 
+import asyncio
 import json
 import os
 import re
@@ -32,7 +35,6 @@ def bundle_zip(md_text: str, md_filename: str, images_dir: Path) -> bytes:
     buf = BytesIO()
     with zipfile.ZipFile(buf, "w", compression=zipfile.ZIP_DEFLATED) as z:
         z.writestr(md_filename, md_text.encode("utf-8"))
-
         if images_dir.exists() and images_dir.is_dir():
             for p in images_dir.rglob("*"):
                 if p.is_file():
@@ -51,40 +53,81 @@ def images_zip(images_dir: Path) -> Optional[bytes]:
     return buf.getvalue()
 
 
+# -----------------------------
+# try_stream: async graph via thread bridge
+# - uses astream("values") so last step IS the final state (no double invoke)
+# - yields ("values", full_state) per step, then ("final", last_state)
+# -----------------------------
 def try_stream(graph_app, inputs: Dict[str, Any]) -> Iterator[Tuple[str, Any]]:
-    """
-    Stream graph progress if available; else invoke.
-    Yields ("updates"/"values"/"final", payload).
-    """
-    try:
-        for step in graph_app.stream(inputs, stream_mode="updates"):
-            yield ("updates", step)
-        out = graph_app.invoke(inputs)
-        yield ("final", out)
-        return
-    except Exception:
-        pass
+    import queue as _queue
+    import threading
 
-    try:
-        for step in graph_app.stream(inputs, stream_mode="values"):
-            yield ("values", step)
-        out = graph_app.invoke(inputs)
-        yield ("final", out)
-        return
-    except Exception:
-        pass
+    result_q = _queue.Queue()
 
-    out = graph_app.invoke(inputs)
-    yield ("final", out)
+    def thread_target():
+        loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(loop)
+
+        async def _collect():
+            try:
+                last = None
+                async for step in graph_app.astream(inputs, stream_mode="values"):
+                    result_q.put(("values", step))
+                    last = step
+                result_q.put(("final", last))
+            except Exception as e:
+                print(f"[try_stream] astream failed: {e}")
+                try:
+                    out = await graph_app.ainvoke(inputs)
+                    result_q.put(("final", out))
+                except Exception as e2:
+                    result_q.put(("error", e2))
+            finally:
+                result_q.put(("done", None))
+
+        loop.run_until_complete(_collect())
+        loop.close()
+
+    t = threading.Thread(target=thread_target, daemon=True)
+    t.start()
+
+    while True:
+        kind, payload = result_q.get()
+        if kind == "done":
+            break
+        elif kind == "error":
+            raise payload
+        else:
+            yield (kind, payload)
+
+
+# -----------------------------
+# Node inference from state diff (needed for "values" stream mode)
+# In "values" mode each payload is full state, not {"node_name": {...}}
+# so we infer the node by which keys changed vs previous state.
+# -----------------------------
+def _infer_node(changed_keys: List[str]) -> Optional[str]:
+    if "mode" in changed_keys or "needs_research" in changed_keys:
+        return "router"
+    if "evidence" in changed_keys:
+        return "research"
+    if "plan" in changed_keys:
+        return "orchestrator"
+    if "sections" in changed_keys:
+        return "worker"
+    if "merged_md" in changed_keys:
+        return "merge_content"
+    if "image_specs" in changed_keys:
+        return "decide_images"
+    if "final" in changed_keys:
+        return "generate_and_place_images"
+    return None
 
 
 def extract_latest_state(current_state: Dict[str, Any], step_payload: Any) -> Dict[str, Any]:
     if isinstance(step_payload, dict):
-        if len(step_payload) == 1 and isinstance(next(iter(step_payload.values())), dict):
-            inner = next(iter(step_payload.values()))
-            current_state.update(inner)
-        else:
-            current_state.update(step_payload)
+        # "values" mode: payload IS the full state — just update directly
+        current_state.update(step_payload)
     return current_state
 
 
@@ -112,7 +155,6 @@ def render_markdown_with_local_images(md: str):
         before = md[last : m.start()]
         if before:
             parts.append(("md", before))
-
         alt = (m.group("alt") or "").strip()
         src = (m.group("src") or "").strip()
         parts.append(("img", f"{alt}|||{src}"))
@@ -157,13 +199,9 @@ def render_markdown_with_local_images(md: str):
 
 
 # -----------------------------
-# ✅ NEW: Past blogs helpers
+# Past blogs helpers
 # -----------------------------
 def list_past_blogs() -> List[Path]:
-    """
-    Returns .md files in current working directory, newest first.
-    Filters out obvious non-blog markdown files if needed.
-    """
     cwd = Path(".")
     files = [p for p in cwd.glob("*.md") if p.is_file()]
     files.sort(key=lambda p: p.stat().st_mtime, reverse=True)
@@ -175,9 +213,6 @@ def read_md_file(p: Path) -> str:
 
 
 def extract_title_from_md(md: str, fallback: str) -> str:
-    """
-    Use first '# ' heading as title if present.
-    """
     for line in md.splitlines():
         if line.startswith("# "):
             t = line[2:].strip()
@@ -194,14 +229,10 @@ st.title("Blog Writing Agent")
 
 with st.sidebar:
     st.header("Generate New Blog")
-    topic = st.text_area(
-        "Topic",
-        height=120,
-    )
+    topic = st.text_area("Topic", height=120)
     as_of = st.date_input("As-of date", value=date.today())
     run_btn = st.button("🚀 Generate Blog", type="primary")
 
-    # ✅ NEW: Past blogs list (keeps everything else intact)
     st.divider()
     st.subheader("Past blogs")
 
@@ -210,7 +241,6 @@ with st.sidebar:
         st.caption("No saved blogs found (*.md in current folder).")
         selected_md_file = None
     else:
-        # Build labels from file name + (optional) parsed title
         options: List[str] = []
         file_by_label: Dict[str, Path] = {}
         for p in past_files[:50]:
@@ -234,28 +264,20 @@ with st.sidebar:
         if st.button("📂 Load selected blog"):
             if selected_md_file:
                 md_text = read_md_file(selected_md_file)
-                # Load into session_state as if it were a run output
                 st.session_state["last_out"] = {
-                    "plan": None,          # old files don't include plan
-                    "evidence": [],        # old files don't include evidence
-                    "image_specs": [],     # optional (not persisted)
-                    "final": md_text,      # markdown body
+                    "plan": None,
+                    "evidence": [],
+                    "image_specs": [],
+                    "final": md_text,
                 }
-                # also update the topic input to the title (best-effort) without changing UI
                 st.session_state["topic_prefill"] = extract_title_from_md(md_text, selected_md_file.stem)
 
-    
-
-# Keep your topic input as-is; optionally prefill for next run after loading a blog
 if "topic_prefill" in st.session_state and isinstance(st.session_state["topic_prefill"], str):
-    # Do not mutate widgets; just keep as a hint.
     pass
 
-# Storage for latest run
 if "last_out" not in st.session_state:
     st.session_state["last_out"] = None
 
-# Layout
 tab_plan, tab_evidence, tab_preview, tab_images, tab_logs = st.tabs(
     ["🧩 Plan", "🔎 Evidence", "📝 Markdown Preview", "🖼️ Images", "🧾 Logs"]
 )
@@ -292,16 +314,18 @@ if run_btn:
     progress_area = st.empty()
 
     current_state: Dict[str, Any] = {}
+    prev_state: Dict[str, Any] = {}
     last_node = None
 
     for kind, payload in try_stream(app, inputs):
-        if kind in ("updates", "values"):
-            node_name = None
-            if isinstance(payload, dict) and len(payload) == 1 and isinstance(next(iter(payload.values())), dict):
-                node_name = next(iter(payload.keys()))
+        if kind == "values":
+            # Infer node from which keys changed vs previous state snapshot
+            changed_keys = [k for k in payload if payload.get(k) != prev_state.get(k)]
+            node_name = _infer_node(changed_keys)
             if node_name and node_name != last_node:
                 status.write(f"➡️ Node: `{node_name}`")
                 last_node = node_name
+            prev_state = dict(payload)
 
             current_state = extract_latest_state(current_state, payload)
 
@@ -315,8 +339,7 @@ if run_btn:
                 "sections_done": len(current_state.get("sections", []) or []),
             }
             progress_area.json(summary)
-
-            log(f"[{kind}] {json.dumps(payload, default=str)[:1200]}")
+            log(f"[values] {json.dumps(payload, default=str)[:1200]}")
 
         elif kind == "final":
             out = payload
@@ -324,7 +347,9 @@ if run_btn:
             status.update(label="✅ Done", state="complete", expanded=False)
             log("[final] received final state")
 
+# -----------------------------
 # Render last result (if any)
+# -----------------------------
 out = st.session_state.get("last_out")
 if out:
     # --- Plan tab ---
@@ -404,7 +429,6 @@ if out:
             elif isinstance(plan_obj, dict):
                 blog_title = plan_obj.get("blog_title", "blog")
             else:
-                # fallback: parse from markdown title
                 blog_title = extract_title_from_md(final_md, "blog")
 
             md_filename = f"{safe_slug(blog_title)}.md"
