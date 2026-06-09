@@ -14,7 +14,7 @@ from typing import Any, Dict, Optional, List, Iterator, Tuple
 
 import pandas as pd
 import streamlit as st
-from fpdf import FPDF
+
 
 # -----------------------------
 # Import your compiled LangGraph app
@@ -52,83 +52,6 @@ def images_zip(images_dir: Path) -> Optional[bytes]:
             if p.is_file():
                 z.write(p, arcname=str(p))
     return buf.getvalue()
-
-
-def generate_pdf(md_text: str, blog_title: str) -> bytes:
-    """Convert markdown text to a clean PDF using fpdf2."""
-    pdf = FPDF()
-    pdf.set_margins(left=20, top=20, right=20)
-    pdf.set_auto_page_break(auto=True, margin=20)
-    pdf.add_page()
-
-    def safe_text(t: str) -> str:
-        """Strip non-latin1 chars fpdf2/Helvetica can't encode, truncate huge tokens."""
-        t = t.encode("latin-1", errors="ignore").decode("latin-1")
-        # Break any unbreakable token longer than 60 chars (URLs, code hashes)
-        words = t.split(" ")
-        out = []
-        for w in words:
-            if len(w) > 60:
-                # insert soft breaks every 60 chars
-                out.append(" ".join(w[i:i+60] for i in range(0, len(w), 60)))
-            else:
-                out.append(w)
-        return " ".join(out)
-
-    # Strip markdown image syntax and inline links
-    clean = re.sub(r"!\[[^\]]*\]\([^)]*\)", "", md_text)
-    clean = re.sub(r"\[([^\]]+)\]\([^)]*\)", r"\1", clean)
-    # Strip bold/italic markers
-    clean = re.sub(r"\*\*([^*]+)\*\*", r"\1", clean)
-    clean = re.sub(r"\*([^*]+)\*", r"\1", clean)
-    # Strip blockquote markers
-    clean = re.sub(r"^>\s*", "", clean, flags=re.MULTILINE)
-
-    in_code_block = False
-    for line in clean.splitlines():
-        stripped = line.strip()
-
-        # Toggle code block
-        if stripped.startswith("```"):
-            in_code_block = not in_code_block
-            continue
-        if in_code_block:
-            try:
-                pdf.set_font("Courier", "", 9)
-                pdf.multi_cell(0, 5, safe_text(stripped) or " ")
-            except Exception:
-                pass
-            continue
-
-        if not stripped:
-            pdf.ln(3)
-        elif stripped.startswith("# "):
-            pdf.set_font("Helvetica", "B", 18)
-            pdf.multi_cell(0, 10, safe_text(stripped[2:]))
-            pdf.ln(2)
-        elif stripped.startswith("## "):
-            pdf.ln(2)
-            pdf.set_font("Helvetica", "B", 14)
-            pdf.multi_cell(0, 8, safe_text(stripped[3:]))
-            pdf.ln(1)
-        elif stripped.startswith("### "):
-            pdf.set_font("Helvetica", "B", 11)
-            pdf.multi_cell(0, 7, safe_text(stripped[4:]))
-        elif stripped.startswith(("- ", "* ", "+ ")):
-            pdf.set_font("Helvetica", "", 10)
-            pdf.multi_cell(0, 6, "  * " + safe_text(stripped[2:]))
-        elif re.match(r"^\d+\.\s", stripped):
-            pdf.set_font("Helvetica", "", 10)
-            pdf.multi_cell(0, 6, safe_text(stripped))
-        else:
-            pdf.set_font("Helvetica", "", 10)
-            try:
-                pdf.multi_cell(0, 6, safe_text(stripped))
-            except Exception:
-                pass  # skip lines that still fail after sanitization
-
-    return bytes(pdf.output())
-
 
 
 # -----------------------------
@@ -595,16 +518,7 @@ if out:
                 mime="application/zip",
             )
 
-            try:
-                pdf_bytes = generate_pdf(final_md, blog_title)
-                st.download_button(
-                    "📄 Download PDF",
-                    data=pdf_bytes,
-                    file_name=f"{safe_slug(blog_title)}.pdf",
-                    mime="application/pdf",
-                )
-            except Exception as e:
-                st.warning(f"PDF generation failed: {e}")
+           
 
     # --- Images tab ---
     with tab_images:
