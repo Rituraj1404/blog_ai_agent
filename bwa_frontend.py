@@ -14,6 +14,7 @@ from typing import Any, Dict, Optional, List, Iterator, Tuple
 
 import pandas as pd
 import streamlit as st
+from fpdf import FPDF
 
 # -----------------------------
 # Import your compiled LangGraph app
@@ -53,10 +54,87 @@ def images_zip(images_dir: Path) -> Optional[bytes]:
     return buf.getvalue()
 
 
+def generate_pdf(md_text: str, blog_title: str) -> bytes:
+    """Convert markdown text to a clean PDF using fpdf2."""
+    pdf = FPDF()
+    pdf.set_margins(left=20, top=20, right=20)
+    pdf.set_auto_page_break(auto=True, margin=20)
+    pdf.add_page()
+
+    def safe_text(t: str) -> str:
+        """Strip non-latin1 chars fpdf2/Helvetica can't encode, truncate huge tokens."""
+        t = t.encode("latin-1", errors="ignore").decode("latin-1")
+        # Break any unbreakable token longer than 60 chars (URLs, code hashes)
+        words = t.split(" ")
+        out = []
+        for w in words:
+            if len(w) > 60:
+                # insert soft breaks every 60 chars
+                out.append(" ".join(w[i:i+60] for i in range(0, len(w), 60)))
+            else:
+                out.append(w)
+        return " ".join(out)
+
+    # Strip markdown image syntax and inline links
+    clean = re.sub(r"!\[[^\]]*\]\([^)]*\)", "", md_text)
+    clean = re.sub(r"\[([^\]]+)\]\([^)]*\)", r"\1", clean)
+    # Strip bold/italic markers
+    clean = re.sub(r"\*\*([^*]+)\*\*", r"\1", clean)
+    clean = re.sub(r"\*([^*]+)\*", r"\1", clean)
+    # Strip blockquote markers
+    clean = re.sub(r"^>\s*", "", clean, flags=re.MULTILINE)
+
+    in_code_block = False
+    for line in clean.splitlines():
+        stripped = line.strip()
+
+        # Toggle code block
+        if stripped.startswith("```"):
+            in_code_block = not in_code_block
+            continue
+        if in_code_block:
+            try:
+                pdf.set_font("Courier", "", 9)
+                pdf.multi_cell(0, 5, safe_text(stripped) or " ")
+            except Exception:
+                pass
+            continue
+
+        if not stripped:
+            pdf.ln(3)
+        elif stripped.startswith("# "):
+            pdf.set_font("Helvetica", "B", 18)
+            pdf.multi_cell(0, 10, safe_text(stripped[2:]))
+            pdf.ln(2)
+        elif stripped.startswith("## "):
+            pdf.ln(2)
+            pdf.set_font("Helvetica", "B", 14)
+            pdf.multi_cell(0, 8, safe_text(stripped[3:]))
+            pdf.ln(1)
+        elif stripped.startswith("### "):
+            pdf.set_font("Helvetica", "B", 11)
+            pdf.multi_cell(0, 7, safe_text(stripped[4:]))
+        elif stripped.startswith(("- ", "* ", "+ ")):
+            pdf.set_font("Helvetica", "", 10)
+            pdf.multi_cell(0, 6, "  * " + safe_text(stripped[2:]))
+        elif re.match(r"^\d+\.\s", stripped):
+            pdf.set_font("Helvetica", "", 10)
+            pdf.multi_cell(0, 6, safe_text(stripped))
+        else:
+            pdf.set_font("Helvetica", "", 10)
+            try:
+                pdf.multi_cell(0, 6, safe_text(stripped))
+            except Exception:
+                pass  # skip lines that still fail after sanitization
+
+    return bytes(pdf.output())
+
+
+
 # -----------------------------
 # try_stream: async graph via thread bridge
-# - uses astream("values") so last step IS the final state (no double invoke)
-# - yields ("values", full_state) per step, then ("final", last_state)
+# - uses stream_mode="updates" so each individual node (including each worker) emits separately
+# - yields ("update", {node_name: node_output}) per step, then ("final", last_full_state)
 # -----------------------------
 def try_stream(graph_app, inputs: Dict[str, Any]) -> Iterator[Tuple[str, Any]]:
     import queue as _queue
@@ -70,11 +148,15 @@ def try_stream(graph_app, inputs: Dict[str, Any]) -> Iterator[Tuple[str, Any]]:
 
         async def _collect():
             try:
-                last = None
-                async for step in graph_app.astream(inputs, stream_mode="values"):
-                    result_q.put(("values", step))
-                    last = step
-                result_q.put(("final", last))
+                last_values = None
+                # stream both updates (per-node) and values (full state) simultaneously
+                async for step in graph_app.astream(inputs, stream_mode=["updates", "values"]):
+                    kind_inner, data = step
+                    if kind_inner == "updates":
+                        result_q.put(("update", data))
+                    elif kind_inner == "values":
+                        last_values = data
+                result_q.put(("final", last_values))
             except Exception as e:
                 print(f"[try_stream] astream failed: {e}")
                 try:
@@ -115,8 +197,12 @@ def _infer_node(changed_keys: List[str]) -> Optional[str]:
         return "orchestrator"
     if "sections" in changed_keys:
         return "worker"
-    if "merged_md" in changed_keys:
+    if "merged_md" in changed_keys and "rewrite_count" not in changed_keys:
         return "merge_content"
+    if "critique" in changed_keys:
+        return "critic"
+    if "rewrite_count" in changed_keys:
+        return "rewrite"
     if "image_specs" in changed_keys:
         return "decide_images"
     if "final" in changed_keys:
@@ -308,43 +394,89 @@ if run_btn:
         "md_with_placeholders": "",
         "image_specs": [],
         "final": "",
+        "critique": None,
+        "rewrite_count": 0,
     }
 
     status = st.status("Running graph…", expanded=True)
     progress_area = st.empty()
+    sections_area = st.empty()
 
     current_state: Dict[str, Any] = {}
-    prev_state: Dict[str, Any] = {}
     last_node = None
+    sections_done = 0
+    total_tasks = 0
 
     for kind, payload in try_stream(app, inputs):
-        if kind == "values":
-            # Infer node from which keys changed vs previous state snapshot
-            changed_keys = [k for k in payload if payload.get(k) != prev_state.get(k)]
-            node_name = _infer_node(changed_keys)
-            if node_name and node_name != last_node:
-                status.write(f"➡️ Node: `{node_name}`")
-                last_node = node_name
-            prev_state = dict(payload)
+        if kind == "update":
+            # payload is {node_name: node_output_dict}
+            for node_name, node_output in payload.items():
+                if not isinstance(node_output, dict):
+                    continue
 
-            current_state = extract_latest_state(current_state, payload)
+                if node_name != last_node:
+                    status.write(f"➡️ Node: `{node_name}`")
+                    last_node = node_name
 
-            summary = {
-                "mode": current_state.get("mode"),
-                "needs_research": current_state.get("needs_research"),
-                "queries": current_state.get("queries", [])[:5] if isinstance(current_state.get("queries"), list) else [],
-                "evidence_count": len(current_state.get("evidence", []) or []),
-                "tasks": len((current_state.get("plan") or {}).get("tasks", [])) if isinstance(current_state.get("plan"), dict) else None,
-                "images": len(current_state.get("image_specs", []) or []),
-                "sections_done": len(current_state.get("sections", []) or []),
-            }
-            progress_area.json(summary)
-            log(f"[values] {json.dumps(payload, default=str)[:1200]}")
+                # Merge node output into current_state
+                current_state.update(node_output)
+
+                # Track plan total tasks once orchestrator fires
+                if node_name == "orchestrator" and "plan" in node_output:
+                    plan_obj = node_output["plan"]
+                    if isinstance(plan_obj, dict):
+                        total_tasks = len(plan_obj.get("tasks", []))
+                    elif hasattr(plan_obj, "tasks"):
+                        total_tasks = len(plan_obj.tasks)
+
+                # worker node may appear as "worker" or "reducer:worker" (subgraph prefix)
+                is_worker = node_name == "worker" or node_name.endswith(":worker")
+                if is_worker and "sections" in node_output:
+                    new_sections = node_output["sections"]
+                    sections_done += len(new_sections) if isinstance(new_sections, list) else 1
+                    if total_tasks > 0:
+                        sections_area.progress(
+                            min(sections_done / total_tasks, 1.0),
+                            text=f"✍️ Sections written: {sections_done}/{total_tasks}"
+                        )
+
+                summary = {
+                    "mode": current_state.get("mode"),
+                    "needs_research": current_state.get("needs_research"),
+                    "evidence_count": len(current_state.get("evidence", []) or []),
+                    "tasks": total_tasks or None,
+                    "sections_done": sections_done,
+                    "images": len(current_state.get("image_specs", []) or []),
+                    "rewrite_count": current_state.get("rewrite_count", 0),
+                }
+                progress_area.json(summary)
+                log(f"[update:{node_name}] {json.dumps(node_output, default=str)[:800]}")
+                # DEBUG: log all node names seen (visible in Logs tab)
+                if node_name not in (last_node or ""):
+                    log(f"[node_seen] {node_name}")
 
         elif kind == "final":
             out = payload
             st.session_state["last_out"] = out
+            sections_area.empty()
             status.update(label="✅ Done", state="complete", expanded=False)
+
+            # Show critic score card immediately after generation
+            critique = out.get("critique")
+            if critique:
+                crit = critique if isinstance(critique, dict) else (critique.model_dump() if hasattr(critique, "model_dump") else None)
+                if crit:
+                    passed = crit.get("passed", False)
+                    score = crit.get("score", "?")
+                    color = "🟢" if passed else "🔴"
+                    st.info(
+                        f"{color} **Quality Gate** — Score: **{score}/10** | "
+                        f"Coherence: {crit.get('coherence')}/10 | "
+                        f"Coverage: {crit.get('coverage')}/10 | "
+                        f"Rewrites: {out.get('rewrite_count', 0)}\n\n"
+                        f"**Critic feedback:** {crit.get('feedback', 'N/A')}"
+                    )
+
             log("[final] received final state")
 
 # -----------------------------
@@ -355,6 +487,22 @@ if out:
     # --- Plan tab ---
     with tab_plan:
         st.subheader("Plan")
+
+        # Critic score card (persistent)
+        critique = out.get("critique")
+        if critique:
+            crit = critique if isinstance(critique, dict) else (critique.model_dump() if hasattr(critique, "model_dump") else None)
+            if crit:
+                passed = crit.get("passed", False)
+                score = crit.get("score", "?")
+                c1, c2, c3, c4 = st.columns(4)
+                c1.metric("Overall Score", f"{score}/10", delta="Pass ✅" if passed else "Rewritten 🔁")
+                c2.metric("Coherence", f"{crit.get('coherence', '?')}/10")
+                c3.metric("Coverage", f"{crit.get('coverage', '?')}/10")
+                c4.metric("Rewrites", out.get("rewrite_count", 0))
+                if not passed:
+                    st.caption(f"Critic feedback: {crit.get('feedback', '')}")
+                st.divider()
         plan_obj = out.get("plan")
         if not plan_obj:
             st.info("No plan found in output.")
@@ -446,6 +594,17 @@ if out:
                 file_name=f"{safe_slug(blog_title)}_bundle.zip",
                 mime="application/zip",
             )
+
+            try:
+                pdf_bytes = generate_pdf(final_md, blog_title)
+                st.download_button(
+                    "📄 Download PDF",
+                    data=pdf_bytes,
+                    file_name=f"{safe_slug(blog_title)}.pdf",
+                    mime="application/pdf",
+                )
+            except Exception as e:
+                st.warning(f"PDF generation failed: {e}")
 
     # --- Images tab ---
     with tab_images:

@@ -101,6 +101,16 @@ class GlobalImagePlan(BaseModel):
     md_with_placeholders: str
     images: List[ImageSpec] = Field(default_factory=list)
 
+
+# ---- Self-critique schema ----
+class CritiqueResult(BaseModel):
+    score: int = Field(..., description="Overall quality score 1-10.")
+    coherence: int = Field(..., description="Logical flow and transitions score 1-10.")
+    coverage: int = Field(..., description="Topic coverage completeness score 1-10.")
+    passed: bool = Field(..., description="True if overall score >= 7, else rewrite needed.")
+    feedback: str = Field(..., description="Concise actionable feedback for the rewriter (2-3 sentences max).")
+
+
 class State(TypedDict):
     topic: str
 
@@ -124,6 +134,10 @@ class State(TypedDict):
     image_specs: List[dict]
 
     final: str
+
+    # self-critique loop
+    critique: Optional[CritiqueResult]
+    rewrite_count: int
 
 
 # -----------------------------
@@ -406,6 +420,85 @@ def merge_content(state: State) -> dict:
     return {"merged_md": merged_md}
 
 
+# -----------------------------
+# 8b) Critic Node (Self-Critique Loop)
+# -----------------------------
+CRITIC_SYSTEM = """You are a senior technical editor performing a quality gate review.
+
+Score the blog on three dimensions:
+- Coherence (1-10): logical flow, smooth transitions between sections, no abrupt jumps.
+- Coverage (1-10): all key subtopics for the stated topic are addressed with sufficient depth.
+- Overall (1-10): holistic quality — would a technical reader find this valuable?
+
+Rules:
+- Be strict. Score 7+ only if genuinely good.
+- passed=True ONLY if overall score >= 7.
+- feedback must be actionable: name exactly what is weak and how to fix it (2-3 sentences).
+"""
+
+def critic_node(state: State) -> dict:
+    critic = llm.with_structured_output(CritiqueResult)
+    plan = state["plan"]
+    assert plan is not None
+
+    result = critic.invoke([
+        SystemMessage(content=CRITIC_SYSTEM),
+        HumanMessage(content=(
+            f"Topic: {state['topic']}\n"
+            f"Blog kind: {plan.blog_kind}\n"
+            f"Audience: {plan.audience}\n\n"
+            f"--- BLOG START ---\n{state['merged_md']}\n--- BLOG END ---"
+        )),
+    ])
+    rewrite_count = state.get("rewrite_count", 0)
+    print(
+        f"[critic] score={result.score} coherence={result.coherence} "
+        f"coverage={result.coverage} passed={result.passed} "
+        f"rewrite_count={rewrite_count}\n[critic] feedback: {result.feedback}"
+    )
+    return {"critique": result}
+
+
+def route_after_critic(state: State) -> str:
+    critique = state.get("critique")
+    rewrite_count = state.get("rewrite_count", 0)
+    # Rewrite only once; if still failing after 1 rewrite, proceed anyway
+    if critique and not critique.passed and rewrite_count < 1:
+        return "rewrite"
+    return "decide_images"
+
+
+REWRITE_SYSTEM = """You are a senior technical writer doing a targeted revision pass.
+
+You will receive the current blog draft and specific editorial feedback.
+Revise the blog to address ALL feedback points while keeping the overall structure intact.
+- Do NOT add new sections unless the feedback explicitly requires it.
+- Improve transitions, deepen weak sections, fix coverage gaps.
+- Output the full revised blog in Markdown starting with the # title.
+"""
+
+def rewrite_node(state: State) -> dict:
+    critique = state.get("critique")
+    assert critique is not None
+    plan = state["plan"]
+    assert plan is not None
+
+    revised = llm.invoke([
+        SystemMessage(content=REWRITE_SYSTEM),
+        HumanMessage(content=(
+            f"Topic: {state['topic']}\n"
+            f"Editorial feedback: {critique.feedback}\n\n"
+            f"--- CURRENT DRAFT ---\n{state['merged_md']}\n--- END DRAFT ---"
+        )),
+    ])
+
+    revised_md = sanitize_md(revised.content.strip())
+    rewrite_count = state.get("rewrite_count", 0)
+    return {
+        "merged_md": revised_md,
+        "rewrite_count": rewrite_count + 1,
+    }
+
 DECIDE_IMAGES_SYSTEM = """You are an expert technical editor.
 Decide if images/diagrams are needed for THIS blog.
 
@@ -601,12 +694,22 @@ def generate_and_place_images(state: State) -> dict:
     return {"final": md}
 
 # build reducer subgraph
+# Flow: merge_content -> critic -> [rewrite -> critic (once)] -> decide_images -> generate_and_place_images
 reducer_graph = StateGraph(State)
 reducer_graph.add_node("merge_content", merge_content)
+reducer_graph.add_node("critic", critic_node)
+reducer_graph.add_node("rewrite", rewrite_node)
 reducer_graph.add_node("decide_images", decide_images)
 reducer_graph.add_node("generate_and_place_images", generate_and_place_images)
+
 reducer_graph.add_edge(START, "merge_content")
-reducer_graph.add_edge("merge_content", "decide_images")
+reducer_graph.add_edge("merge_content", "critic")
+reducer_graph.add_conditional_edges(
+    "critic",
+    route_after_critic,
+    {"rewrite": "rewrite", "decide_images": "decide_images"},
+)
+reducer_graph.add_edge("rewrite", "critic")  # re-score after rewrite
 reducer_graph.add_edge("decide_images", "generate_and_place_images")
 reducer_graph.add_edge("generate_and_place_images", END)
 reducer_subgraph = reducer_graph.compile()
